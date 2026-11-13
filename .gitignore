@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 *.tmp
+
+# Pruebas: usan una copia de datos personales, no se suben a este repositorio publico
+pruebas/
