@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Aprendizaje</title>
+  <link rel="icon" href="icono.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="estilos.css">
+</head>
+<body>
+  <header class="cabecera">
+    <div class="cabecera-fila">
+      <h1>Aprendizaje</h1>
+      <nav class="pestanas" aria-label="Secciones">
+        <button type="button" data-accion="vista" data-vista="hoy">Hoy</button>
+        <button type="button" data-accion="vista" data-vista="progreso">Progreso</button>
+      </nav>
+    </div>
+    <div id="proyectos" class="proyectos" role="group" aria-label="Proyecto"></div>
+  </header>
+
+  <main id="vista" class="vista" aria-live="polite">
+    <p class="nota">Cargando…</p>
+  </main>
+
+  <div id="globo" class="globo" role="status" hidden></div>
+
+  <script src="almacen.js"></script>
+  <script src="graficos.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
