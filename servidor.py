@@ -4,6 +4,8 @@ Hace dos cosas, y solo para este ordenador (127.0.0.1):
   1. Entrega los archivos de la aplicación (index.html, estilos, código).
   2. Lee y escribe los archivos de datos de la carpeta de aprendizaje
      (proyectos.json y los .json de la carpeta datos/ de cada proyecto).
+  3. Si la carpeta de aprendizaje está enlazada con GitHub, sincroniza esos
+     archivos de datos (y solo esos) cuando la aplicación se lo pide.
 
 No necesita instalar nada: usa solo lo que trae Python.
 
@@ -15,8 +17,10 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
+import threading
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -29,6 +33,59 @@ CARPETA_APP = Path(__file__).resolve().parent
 RUTA_PERMITIDA = re.compile(
     r"^02-proyectos/(proyectos\.json|[a-z0-9][a-z0-9-]*/datos/[a-z0-9][a-z0-9-]*\.json)$"
 )
+
+# Archivos que solo se leen: las tarjetas de cada proyecto.
+RUTA_SOLO_LECTURA = re.compile(r"^02-proyectos/[a-z0-9][a-z0-9-]*/tarjetas\.tsv$")
+
+# Lo único que la aplicación guarda y sube a GitHub por su cuenta.
+RUTAS_GIT = ["02-proyectos/proyectos.json", "02-proyectos/*/datos/*.json"]
+CERROJO_GIT = threading.Lock()
+
+
+def git(carpeta, *argumentos, espera=40):
+    """Ejecuta una orden de git en la carpeta de datos. Devuelve (código, texto)."""
+    entorno = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    opciones = {}
+    if os.name == "nt":
+        opciones["creationflags"] = subprocess.CREATE_NO_WINDOW
+    resultado = subprocess.run(
+        ["git", "-C", str(carpeta), *argumentos], capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=espera, env=entorno, **opciones)
+    return resultado.returncode, (resultado.stdout + resultado.stderr).strip()
+
+
+def sincronizar(carpeta):
+    """Guarda los archivos de datos, trae lo nuevo de GitHub y sube lo local.
+
+    Nunca fuerza nada: si hay un conflicto, deshace el intento y lo cuenta.
+    """
+    if not (carpeta / ".git").exists():
+        return {"ok": True, "estado": "sin-git", "detalle": "La carpeta no tiene historial de cambios."}
+    with CERROJO_GIT:
+        try:
+            if not git(carpeta, "remote")[1]:
+                return {"ok": True, "estado": "sin-git", "detalle": "La carpeta no está enlazada con GitHub."}
+            # 1. Guardar los datos locales (solo los archivos de datos).
+            git(carpeta, "add", "--", *RUTAS_GIT)
+            if git(carpeta, "diff", "--cached", "--quiet", "--", *RUTAS_GIT)[0] == 1:
+                codigo, salida = git(carpeta, "commit", "-m", "Datos de la aplicación", "--", *RUTAS_GIT)
+                if codigo != 0:
+                    return {"ok": False, "estado": "error-guardar", "detalle": salida[-400:]}
+            # 2. Traer lo que haya escrito el teléfono.
+            codigo, salida = git(carpeta, "pull", "--rebase", "--autostash", espera=90)
+            if codigo != 0:
+                git(carpeta, "rebase", "--abort")
+                return {"ok": False, "estado": "error-traer", "detalle": salida[-400:]}
+            # 3. Subir.
+            codigo, salida = git(carpeta, "push", espera=90)
+            if codigo != 0:
+                return {"ok": False, "estado": "error-subir", "detalle": salida[-400:]}
+            return {"ok": True, "estado": "al-dia", "detalle": "Datos sincronizados con GitHub."}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "estado": "sin-respuesta", "detalle": "GitHub no respondió a tiempo."}
+        except FileNotFoundError:
+            return {"ok": False, "estado": "sin-git", "detalle": "No encuentro el programa git."}
+
 
 # Únicos archivos de la aplicación que se entregan al navegador.
 TIPOS_ESTATICOS = {
@@ -71,9 +128,9 @@ class Manejador(BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").lower()
         return host in {f"127.0.0.1:{self.puerto}", f"localhost:{self.puerto}"}
 
-    def _ruta_de_datos(self, consulta):
+    def _ruta_de_datos(self, consulta, solo_lectura=False):
         ruta = (parse_qs(consulta).get("ruta") or [""])[0]
-        if not RUTA_PERMITIDA.fullmatch(ruta):
+        if not (RUTA_PERMITIDA.fullmatch(ruta) or (solo_lectura and RUTA_SOLO_LECTURA.fullmatch(ruta))):
             return None
         destino = (self.carpeta_datos / ruta).resolve()
         if self.carpeta_datos not in destino.parents:
@@ -91,15 +148,17 @@ class Manejador(BaseHTTPRequestHandler):
                 "ok": True,
                 "datos": str(self.carpeta_datos),
                 "existe": (self.carpeta_datos / "02-proyectos").is_dir(),
+                "git": (self.carpeta_datos / ".git").exists(),
             })
 
         if partes.path == "/api/archivo":
-            destino = self._ruta_de_datos(partes.query)
+            destino = self._ruta_de_datos(partes.query, solo_lectura=True)
             if destino is None:
                 return self._json(HTTPStatus.BAD_REQUEST, {"error": "ruta no permitida"})
             if not destino.is_file():
                 return self._json(HTTPStatus.NOT_FOUND, {"error": "no existe"})
-            return self._responder(HTTPStatus.OK, destino.read_bytes())
+            tipo = "application/json; charset=utf-8" if destino.suffix == ".json" else "text/plain; charset=utf-8"
+            return self._responder(HTTPStatus.OK, destino.read_bytes(), tipo)
 
         if partes.path.startswith("/api/"):
             return self._json(HTTPStatus.NOT_FOUND, {"error": "no existe"})
@@ -113,6 +172,16 @@ class Manejador(BaseHTTPRequestHandler):
         return self._responder(HTTPStatus.OK, archivo.read_bytes(), tipo)
 
     do_HEAD = do_GET
+
+    # ---------- POST ----------
+    def do_POST(self):
+        if not self._host_valido():
+            return self._json(HTTPStatus.FORBIDDEN, {"error": "host no permitido"})
+        if self.headers.get("X-Aprendizaje") != "1":
+            return self._json(HTTPStatus.FORBIDDEN, {"error": "falta la cabecera de la aplicación"})
+        if urlsplit(self.path).path != "/api/sincronizar":
+            return self._json(HTTPStatus.NOT_FOUND, {"error": "no existe"})
+        return self._json(HTTPStatus.OK, sincronizar(self.carpeta_datos))
 
     # ---------- PUT ----------
     def do_PUT(self):

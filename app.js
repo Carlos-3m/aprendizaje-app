@@ -1,7 +1,7 @@
 'use strict';
-/* Aplicación de aprendizaje · versión 0.1
-   Dos pantallas: «Hoy» (guía y cronometra la sesión) y «Progreso»
-   (muestra si las sesiones salen fáciles, justas o difíciles). */
+/* Aplicación de aprendizaje · versión 0.2
+   Pantallas: «Hoy» (guía y cronometra la sesión), «Tarjetas» (repaso espaciado),
+   «Progreso» (si las sesiones salen fáciles, justas o difíciles) y «Ajustes». */
 (() => {
   // ───────────────────────── Vocabulario ─────────────────────────
   const TIPOS = {
@@ -97,10 +97,20 @@
     enCurso: Memoria.leer('enCurso', null),
     guardada: null,
     mensajeFormulario: '',
+    tarjetas: [],          // las tarjetas del proyecto, leídas de tarjetas.tsv
+    repasos: null,         // el estado de repaso guardado (datos/repasos.json)
+    repaso: Memoria.leer('repaso', null),   // la ronda de repaso en curso
+    repasoHecho: null,
+    repasoError: '',
+    sinc: null,            // resultado de la última sincronización con GitHub
+    carpeta: '',
+    mensajeAjustes: '',
   };
   const proyecto = () => estado.proyectos.find((p) => p.slug === estado.slug);
   const rutaSesiones = (slug) => '02-proyectos/' + slug + '/datos/sesiones.json';
   const rutaProxima = (slug) => '02-proyectos/' + slug + '/datos/proxima.json';
+  const rutaRepasos = (slug) => '02-proyectos/' + slug + '/datos/repasos.json';
+  const rutaTarjetas = (slug) => '02-proyectos/' + slug + '/tarjetas.tsv';
 
   function guardarEnCurso() {
     if (estado.enCurso) Memoria.guardar('enCurso', estado.enCurso); else Memoria.borrar('enCurso');
@@ -114,10 +124,14 @@
 
   // ───────────────────────── Datos ─────────────────────────
   async function cargarProyecto() {
-    const [archivo, proxima] = await Promise.all([
+    const [archivo, proxima, repasos, tsv] = await Promise.all([
       Almacen.leer(rutaSesiones(estado.slug)),
       Almacen.leer(rutaProxima(estado.slug)),
+      Almacen.leer(rutaRepasos(estado.slug)),
+      Almacen.leerTexto(rutaTarjetas(estado.slug)),
     ]);
+    estado.repasos = repasos;
+    estado.tarjetas = leerTSV(tsv);
     const sesiones = (archivo && Array.isArray(archivo.sesiones)) ? archivo.sesiones.slice() : [];
     sesiones.sort((a, b) => (a.fecha || '').localeCompare(b.fecha || '') || (a.numero || 0) - (b.numero || 0));
     estado.sesiones = sesiones;
@@ -274,7 +288,7 @@
   const botonPausa = (s) => `<button type="button" class="boton" data-accion="pausa">${s.pausaDesde ? 'Reanudar' : 'Pausa'}</button>`;
   const pieSesion = () => '<p class="pie-sesion"><button type="button" class="enlace" data-accion="descartar">Descartar esta sesión</button></p>';
 
-  function vistaTarjetas(s) {
+  function vistaFaseTarjetas(s) {
     return `<section class="tarjeta">${cabeceraSesion(s)}
       <form id="form-tarjetas" novalidate>
         <fieldset class="opciones"><legend>¿Has repasado hoy tus tarjetas?</legend>
@@ -285,7 +299,7 @@
           <label class="campo">Tarjetas repasadas <input type="number" name="t_repasadas" min="0" inputmode="numeric"></label>
           <label class="campo">Marcadas «Otra vez» <input type="number" name="t_otra_vez" min="0" inputmode="numeric"></label>
         </div>
-        <p class="ayuda">El repaso se hace fuera de la sesión. Si no sabes las cifras, déjalas en blanco.</p>
+        <p class="ayuda">${diaDeHoy() ? 'Relleno con tu repaso de hoy en la pestaña Tarjetas.' : 'El repaso se hace fuera de la sesión, en la pestaña Tarjetas. Si no sabes las cifras, déjalas en blanco.'}</p>
         <p class="error" role="alert">${esc(estado.mensajeFormulario)}</p>
         <div class="acciones"><button type="submit" class="boton principal">Empezar el calentamiento</button></div>
       </form>${pieSesion()}
@@ -392,7 +406,7 @@
   function vistaHoy() {
     const s = estado.enCurso;
     if (s) {
-      if (s.fase === 'tarjetas') return vistaTarjetas(s);
+      if (s.fase === 'tarjetas') return vistaFaseTarjetas(s);
       if (s.fase === 'calentamiento') return vistaCalentamiento(s);
       if (s.fase === 'nucleo') return vistaNucleo(s);
       return vistaCierre(s);
@@ -507,12 +521,306 @@
     if (acierto) Graficos.acierto(acierto, estado.sesiones, nombreTipo);
   }
 
+
+  // ───────────────────────── Sincronización ─────────────────────────
+  async function sincronizar(silencioso) {
+    try { estado.sinc = await Almacen.sincronizar(); }
+    catch (e) { estado.sinc = { ok: false, estado: 'error', detalle: e.message }; }
+    if (!estado.sinc.ok && !silencioso) globo('No se pudo sincronizar con GitHub');
+    if (estado.vista === 'ajustes') pintar();
+    return estado.sinc;
+  }
+
+  // ───────────────────────── Tarjetas ─────────────────────────
+  const NUEVAS_AL_DIA = 5;
+
+  /** Identificador estable de una tarjeta, calculado a partir de su pregunta. */
+  function huella(texto) {
+    let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+    for (let i = 0; i < texto.length; i++) {
+      const c = texto.charCodeAt(i);
+      h1 = Math.imul(h1 ^ c, 2654435761); h2 = Math.imul(h2 ^ c, 1597334677);
+    }
+    h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+    h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+    return (h2 >>> 0).toString(16).padStart(8, '0') + (h1 >>> 0).toString(16).padStart(8, '0');
+  }
+  /** Lee tarjetas.tsv: pregunta, respuesta y etiquetas separadas por tabuladores. */
+  function leerTSV(texto) {
+    if (!texto) return [];
+    const vistas = new Set();
+    return texto.replace(/^\uFEFF/, '').split(/\r?\n/).map((linea) => linea.split('\t'))
+      .filter((c) => c.length >= 2 && c[0].trim() && c[1].trim())
+      .map((c) => ({ id: huella(c[0].trim()), frente: c[0].trim(), dorso: c[1].trim() }))
+      .filter((tarjeta) => !vistas.has(tarjeta.id) && vistas.add(tarjeta.id));
+  }
+  function sumarDias(iso, dias) { const f = aFecha(iso); f.setDate(f.getDate() + dias); return fechaISO(f); }
+  const guardadoTarjetas = () => (estado.repasos && estado.repasos.tarjetas) || {};
+  function diaDeHoy() { return (estado.repasos && estado.repasos.dias && estado.repasos.dias[fechaISO()]) || null; }
+
+  /** Qué toca hoy: las que vencen y, hasta el límite diario, las nuevas. */
+  function colaDeHoy() {
+    const hoy = fechaISO();
+    const guardado = guardadoTarjetas();
+    const vencidas = estado.tarjetas.filter((x) => guardado[x.id] && guardado[x.id].vence <= hoy)
+      .sort((a, b) => guardado[a.id].vence.localeCompare(guardado[b.id].vence));
+    const yaNuevas = (diaDeHoy() || {}).nuevas || 0;
+    const limite = Math.max(0, (proyecto().tarjetas_nuevas_dia ?? NUEVAS_AL_DIA) - yaNuevas);
+    const nuevas = estado.tarjetas.filter((x) => !guardado[x.id]).slice(0, limite);
+    return { vencidas, nuevas };
+  }
+  function pendientesDeHoy() {
+    if (!estado.repasos || !estado.tarjetas.length) return 0;
+    const r = estado.repaso;
+    if (r && r.slug === estado.slug && r.cola.length) return r.cola.length;
+    const { vencidas, nuevas } = colaDeHoy();
+    return vencidas.length + nuevas.length;
+  }
+
+  /** Repaso espaciado: cada acierto aleja la tarjeta; cada fallo la trae a mañana. */
+  function calificar(previo, nota, hoy, vistaHoy, falladaHoy) {
+    const e = previo ? { ...previo } : { intervalo: 0, facilidad: 2.5, repasos: 0, fallos: 0 };
+    if (!vistaHoy) e.repasos += 1;
+    if (nota === 'otra') {
+      if (!falladaHoy) { e.fallos += 1; e.facilidad = Math.max(1.3, Number((e.facilidad - 0.2).toFixed(2))); }
+      e.intervalo = 0;                       // sigue en la ronda de hoy
+    } else if (falladaHoy || !previo || !previo.intervalo) {
+      e.intervalo = (nota === 'facil' && !falladaHoy) ? 4 : 1;
+    } else if (nota === 'bien') {
+      e.intervalo = Math.max(e.intervalo + 1, Math.round(e.intervalo * e.facilidad));
+    } else {
+      e.intervalo = Math.max(e.intervalo + 2, Math.round(e.intervalo * e.facilidad * 1.3));
+      e.facilidad = Number((e.facilidad + 0.15).toFixed(2));
+    }
+    e.vence = sumarDias(hoy, e.intervalo);
+    e.ultimo = hoy;
+    return e;
+  }
+
+  function guardarRonda() { if (estado.repaso) Memoria.guardar('repaso', estado.repaso); else Memoria.borrar('repaso'); }
+
+  function empezarRepaso() {
+    const { vencidas, nuevas } = colaDeHoy();
+    const cola = [...vencidas, ...nuevas].map((x) => x.id);
+    if (!cola.length) return;
+    estado.repasoHecho = null; estado.repasoError = '';
+    estado.repaso = { id: 'r-' + Date.now(), slug: estado.slug, fecha: fechaISO(), cola, mostrada: false,
+      cambios: {}, vistas: [], falladas: [], frentesFallados: [], nuevas: [], porGuardar: false };
+    guardarRonda(); pintar();
+  }
+
+  function responderTarjeta(nota) {
+    const r = estado.repaso;
+    if (!r || !r.cola.length || !r.mostrada) return;
+    const id = r.cola.shift();
+    const tarjeta = estado.tarjetas.find((x) => x.id === id);
+    const guardado = guardadoTarjetas();
+    const vista = r.vistas.includes(id);
+    const fallada = r.falladas.includes(id);
+    const nuevo = calificar(r.cambios[id] || guardado[id] || null, nota, r.fecha, vista, fallada);
+    if (tarjeta) nuevo.frente = tarjeta.frente.slice(0, 90);
+    r.cambios[id] = nuevo;
+    if (!vista) { r.vistas.push(id); if (!guardado[id]) r.nuevas.push(id); }
+    if (nota === 'otra') {
+      if (!fallada) { r.falladas.push(id); if (tarjeta) r.frentesFallados.push(tarjeta.frente); }
+      r.cola.push(id);
+    }
+    r.mostrada = false;
+    guardarRonda();
+    if (r.cola.length) pintar(); else guardarRepaso();
+  }
+
+  /** Escribe la ronda en datos/repasos.json, releyendo antes el archivo. */
+  async function guardarRepaso() {
+    const r = estado.repaso;
+    if (!r) return;
+    if (!r.vistas.length) { estado.repaso = null; guardarRonda(); pintar(); return; }
+    r.porGuardar = true; guardarRonda();
+    try {
+      const ruta = rutaRepasos(r.slug);
+      const archivo = (await Almacen.leer(ruta)) || {};
+      archivo.aviso = archivo.aviso || 'Estado de repaso de las tarjetas. Lo escribe la aplicación. «tarjetas» guarda cuándo vuelve a tocar cada una; «dias» resume cada día de repaso y qué tarjetas se fallaron.';
+      archivo.tarjetas = archivo.tarjetas || {};
+      archivo.dias = archivo.dias || {};
+      Object.assign(archivo.tarjetas, r.cambios);
+      const dia = archivo.dias[r.fecha] || { repasadas: 0, otra_vez: 0, nuevas: 0, falladas: [], rondas: [] };
+      dia.rondas = dia.rondas || [];
+      if (!dia.rondas.includes(r.id)) {
+        dia.rondas.push(r.id);
+        dia.repasadas += r.vistas.length;
+        dia.otra_vez += r.falladas.length;
+        dia.nuevas += r.nuevas.length;
+        dia.falladas = [...new Set([...(dia.falladas || []), ...r.frentesFallados])];
+      }
+      archivo.dias[r.fecha] = dia;
+      await Almacen.escribir(ruta, archivo);
+      estado.repasoHecho = { repasadas: r.vistas.length, otra_vez: r.falladas.length, falladas: r.frentesFallados.slice(), quedaban: r.cola.length };
+      if (r.slug === estado.slug) estado.repasos = archivo;
+      estado.repaso = null; estado.repasoError = '';
+      guardarRonda();
+      sincronizar();
+    } catch (e) {
+      estado.repasoError = 'No se pudo guardar el repaso: ' + e.message + ' Está a salvo en este dispositivo.';
+    }
+    pintar();
+  }
+
+  /** Primera vez: crea datos/repasos.json. */
+  async function iniciarTarjetas(conocidas) {
+    const hoy = fechaISO();
+    const archivo = { aviso: 'Estado de repaso de las tarjetas. Lo escribe la aplicación. «tarjetas» guarda cuándo vuelve a tocar cada una; «dias» resume cada día de repaso y qué tarjetas se fallaron.', tarjetas: {}, dias: {} };
+    if (conocidas) {
+      const porDia = Math.max(10, Math.ceil(estado.tarjetas.length / 10));
+      estado.tarjetas.forEach((x, i) => {
+        archivo.tarjetas[x.id] = { intervalo: 3, facilidad: 2.5, repasos: 0, fallos: 0, vence: sumarDias(hoy, Math.floor(i / porDia)), ultimo: null, frente: x.frente.slice(0, 90) };
+      });
+    }
+    try {
+      await Almacen.escribir(rutaRepasos(estado.slug), archivo);
+      estado.repasos = archivo; estado.repasoError = '';
+      sincronizar();
+    } catch (e) { estado.repasoError = 'No se pudo preparar el repaso: ' + e.message; }
+    pintar();
+  }
+
+  function vistaRepaso(r) {
+    const tarjeta = estado.tarjetas.find((x) => x.id === r.cola[0]);
+    const total = new Set([...r.vistas, ...r.cola]).size;
+    const hechas = total - new Set(r.cola).size;
+    if (!tarjeta) return `<section class="tarjeta"><h2>Esta tarjeta ya no existe</h2><p>Puede que el coach la haya cambiado.</p><div class="acciones"><button type="button" class="boton" data-accion="repaso-saltar">Seguir</button></div></section>`;
+    return `<section class="tarjeta naipe">
+      <p class="sobretitulo">${total - hechas === 1 ? 'Queda 1' : 'Quedan ' + (total - hechas)} de ${total}${r.falladas.includes(tarjeta.id) ? ' · repetida porque la fallaste' : ''}</p>
+      <div class="barra"><div class="barra-relleno" style="width:${(hechas / total) * 100}%"></div></div>
+      <p class="naipe-frente">${esc(tarjeta.frente)}</p>
+      ${r.mostrada
+        ? `<div class="naipe-dorso">${esc(tarjeta.dorso)}</div>
+           <div class="acciones notas"><button type="button" class="boton" data-accion="nota" data-valor="otra">Otra vez</button><button type="button" class="boton principal" data-accion="nota" data-valor="bien">Bien</button><button type="button" class="boton" data-accion="nota" data-valor="facil">Fácil</button></div>`
+        : `<p class="ayuda">Responde de memoria, en voz alta o por escrito, antes de mirar.</p>
+           <div class="acciones"><button type="button" class="boton principal" data-accion="mostrar">Mostrar respuesta</button></div>`}
+      <p class="pie-sesion"><button type="button" class="enlace" data-accion="repaso-terminar">Terminar por hoy y guardar</button></p>
+    </section>`;
+  }
+
+  function vistaTarjetas() {
+    const error = estado.repasoError ? `<div class="aviso aviso-atencion">${esc(estado.repasoError)} <button type="button" class="enlace" data-accion="repaso-reintentar">Reintentar</button></div>` : '';
+    if (!estado.tarjetas.length) return `<section class="tarjeta"><h2>Este proyecto todavía no tiene tarjetas</h2><p>El coach las escribe en el archivo tarjetas.tsv del proyecto, a partir de tus errores.</p></section>`;
+    const r = estado.repaso;
+    if (r && r.slug === estado.slug && r.cola.length && !r.porGuardar) return error + vistaRepaso(r);
+    if (!estado.repasos) {
+      const n = estado.tarjetas.length;
+      const porDia = Math.max(10, Math.ceil(n / 10));
+      return error + `<section class="tarjeta">
+        <p class="sobretitulo">Primera vez</p>
+        <h2>${n === 1 ? 'Hay 1 tarjeta' : 'Hay ' + n + ' tarjetas'} en este proyecto</h2>
+        <p>El calendario de repaso empieza de cero. Elige cómo:</p>
+        <ul class="lista">
+          <li><strong>Ya las conozco</strong> (venían de Anki): ${n <= porDia ? 'tocan todas hoy' : 'se reparten en los próximos ' + Math.ceil(n / porDia) + ' días, ' + porDia + ' al día'}, y después cada una se aleja según aciertes.</li>
+          <li><strong>Son nuevas para mí</strong>: entran ${NUEVAS_AL_DIA} al día.</li>
+        </ul>
+        <div class="acciones"><button type="button" class="boton principal" data-accion="tarjetas-iniciar" data-valor="conocidas">Ya las conozco</button><button type="button" class="boton" data-accion="tarjetas-iniciar" data-valor="nuevas">Son nuevas para mí</button></div>
+      </section>`;
+    }
+    const { vencidas, nuevas } = colaDeHoy();
+    const pendientes = vencidas.length + nuevas.length;
+    const hoy = diaDeHoy();
+    const manana = sumarDias(fechaISO(), 1);
+    const guardado = guardadoTarjetas();
+    const paraManana = estado.tarjetas.filter((x) => guardado[x.id] && guardado[x.id].vence === manana).length;
+    let html = error;
+    const hecho = estado.repasoHecho;
+    if (hecho) {
+      html += `<section class="tarjeta">
+        <p class="sobretitulo">Repaso guardado</p>
+        <h2>${hecho.repasadas} ${hecho.repasadas === 1 ? 'tarjeta repasada' : 'tarjetas repasadas'}, ${hecho.otra_vez} «Otra vez»</h2>
+        ${hecho.falladas.length ? `<h3>Las que fallaste</h3><ul class="lista">${hecho.falladas.map((f) => `<li>${esc(f)}</li>`).join('')}</ul><p class="ayuda">El coach las verá y las usará en el calentamiento.</p>` : '<p>Ninguna fallada.</p>'}
+      </section>`;
+    }
+    html += `<section class="tarjeta">
+      <p class="sobretitulo">${estado.tarjetas.length} tarjetas en el proyecto</p>
+      <h2>${pendientes ? (pendientes === 1 ? 'Hoy toca 1 tarjeta' : 'Hoy tocan ' + pendientes + ' tarjetas') : 'Nada pendiente por hoy'}</h2>
+      <p class="tiempos">${pendientes ? vencidas.length + ' de repaso' + (nuevas.length ? ' · ' + nuevas.length + ' nuevas' : '') + ' · ' : ''}${hoy ? 'hoy llevas ' + hoy.repasadas + ' repasadas (' + hoy.otra_vez + ' «Otra vez») · ' : ''}mañana: ${paraManana}</p>
+      ${pendientes ? '<div class="acciones"><button type="button" class="boton principal" data-accion="repaso-empezar">Empezar repaso</button></div>' : ''}
+    </section>`;
+    return html;
+  }
+
+  // ───────────────────────── Pantalla «Ajustes» ─────────────────────────
+  function vistaAjustes() {
+    const mensaje = estado.mensajeAjustes ? `<p class="error" role="alert">${esc(estado.mensajeAjustes)}</p>` : '';
+    if (Almacen.modo === 'local') {
+      const s = estado.sinc;
+      const linea = !s ? etiqueta('et-neutra', '·', 'Sin comprobar')
+        : s.estado === 'sin-git' ? etiqueta('et-neutra', '·', 'Sin copia en GitHub')
+        : s.ok ? etiqueta('et-bien', '✓', 'Al día con GitHub')
+        : etiqueta('et-atencion', '▲', 'Sin sincronizar');
+      return `<section class="tarjeta">
+        <h2>Dónde están tus datos</h2>
+        <p>En este ordenador, en la carpeta <strong>${esc(estado.carpeta || 'de aprendizaje')}</strong>.</p>
+        <p>${linea} <span class="junto">${esc(s ? s.detalle || '' : '')}</span></p>
+        <p class="ayuda">La aplicación guarda y sube a GitHub solo sus archivos de datos (sesiones y repasos). Lo demás lo sube el coach al cerrar cada sesión.</p>
+        <div class="acciones"><button type="button" class="boton" data-accion="sincronizar">Sincronizar ahora</button></div>
+      </section>
+      <section class="tarjeta"><h2>Versión</h2><p>Aplicación de aprendizaje 0.2 · en este ordenador.</p></section>`;
+    }
+    const c = Almacen.configuracion();
+    if (c && c.token) {
+      return `<section class="tarjeta">
+        <h2>Este dispositivo está conectado</h2>
+        <p>${etiqueta('et-bien', '✓', 'Conectado')} <span class="junto">${esc(c.usuario)}/${esc(c.repositorio)}</span></p>
+        <p class="ayuda">Lo que hagas aquí se guarda directamente en tu repositorio privado. La llave de acceso está guardada solo en este navegador.</p>
+        ${mensaje}
+        <div class="acciones"><button type="button" class="boton" data-accion="desconectar">Desconectar este dispositivo</button></div>
+      </section>
+      <section class="tarjeta"><h2>Versión</h2><p>Aplicación de aprendizaje 0.2 · conectada a GitHub.</p></section>`;
+    }
+    const d = Almacen.configuracionPorDefecto();
+    return `<section class="tarjeta">
+      <p class="sobretitulo">Primera vez en este dispositivo</p>
+      <h2>Conecta la aplicación con tus datos</h2>
+      <p>Tus datos están en tu repositorio privado de GitHub. Para leerlos y guardar desde aquí hace falta una <strong>llave de acceso</strong> (GitHub la llama <em>token</em>). Se guarda solo en este navegador.</p>
+      <form id="form-conexion" novalidate>
+        <div class="dos-columnas">
+          <label class="campo">Usuario de GitHub <input name="usuario" value="${esc(d.usuario)}" autocapitalize="none" autocomplete="off" spellcheck="false"></label>
+          <label class="campo">Repositorio <input name="repositorio" value="${esc(d.repositorio)}" autocapitalize="none" autocomplete="off" spellcheck="false"></label>
+        </div>
+        <label class="campo">Llave de acceso <input name="token" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_…"></label>
+        ${mensaje}
+        <div class="acciones"><button type="submit" class="boton principal">Conectar</button></div>
+      </form>
+      <details><summary>Cómo crear la llave</summary>
+        <ol class="lista">
+          <li>En un ordenador, entra en GitHub: Settings → Developer settings → Personal access tokens → Fine-grained tokens → Generate new token.</li>
+          <li>En «Repository access» elige «Only select repositories» y marca solo tu repositorio de datos.</li>
+          <li>En «Permissions» → «Repository permissions», pon «Contents» en «Read and write». Nada más.</li>
+          <li>Genera la llave, cópiala y pégala aquí.</li>
+        </ol>
+      </details>
+    </section>`;
+  }
+
+  async function conectar(formulario) {
+    const datos = new FormData(formulario);
+    const c = { usuario: String(datos.get('usuario') || '').trim(), repositorio: String(datos.get('repositorio') || '').trim(), rama: 'main', token: String(datos.get('token') || '').trim() };
+    if (!c.usuario || !c.repositorio || !c.token) { estado.mensajeAjustes = 'Rellena los tres campos.'; pintar(); return; }
+    estado.mensajeAjustes = 'Comprobando…'; pintar();
+    const resultado = await Almacen.probar(c);
+    if (!resultado.ok) { estado.mensajeAjustes = resultado.detalle; pintar(); return; }
+    Almacen.guardarConfiguracion(c);
+    estado.mensajeAjustes = '';
+    estado.vista = 'hoy';
+    await iniciar();
+  }
+
   // ───────────────────────── Pintar ─────────────────────────
   function pintarCabecera() {
     document.querySelectorAll('.pestanas button').forEach((boton) => {
       const activa = boton.dataset.vista === estado.vista;
       boton.classList.toggle('activa', activa);
       if (activa) boton.setAttribute('aria-current', 'page'); else boton.removeAttribute('aria-current');
+      if (boton.dataset.vista === 'tarjetas') {
+        const n = estado.error || estado.cargando || !proyecto() ? 0 : pendientesDeHoy();
+        boton.innerHTML = 'Tarjetas' + (n ? `<span class="cuenta" aria-label="${n} pendientes">${n}</span>` : '');
+      }
     });
     const bloqueado = Boolean(estado.enCurso);
     $('#proyectos').innerHTML = estado.proyectos.map((p) => {
@@ -523,7 +831,7 @@
 
   function restaurarBorrador() {
     const s = estado.enCurso;
-    const formulario = $('#vista form');
+    const formulario = $('#form-tarjetas, #form-cierre');
     if (!s || !formulario || !s.borrador) return;
     for (const [nombre, valor] of Object.entries(s.borrador)) {
       const campos = formulario.querySelectorAll('[name="' + nombre + '"]');
@@ -535,12 +843,17 @@
   }
 
   function pintar() {
+    if (!Almacen.conectado()) estado.vista = 'ajustes';
     pintarCabecera();
     const vista = $('#vista');
-    if (estado.error) {
-      vista.innerHTML = `<section class="tarjeta"><h2>No puedo leer los datos</h2><p>${esc(estado.error)}</p><p>Abre la aplicación con el archivo <strong>Abrir aplicacion.bat</strong> y deja su ventana abierta.</p><div class="acciones"><button type="button" class="boton" data-accion="recargar">Volver a intentar</button></div></section>`;
+    if (estado.vista === 'ajustes') {
+      vista.innerHTML = vistaAjustes();
+    } else if (estado.error) {
+      vista.innerHTML = `<section class="tarjeta"><h2>No puedo leer los datos</h2><p>${esc(estado.error)}</p>${Almacen.modo === 'local' ? '<p>Abre la aplicación con el archivo <strong>Abrir aplicacion.bat</strong> y deja su ventana abierta.</p>' : '<p>Comprueba la conexión a internet o revisa la llave de acceso en Ajustes.</p>'}<div class="acciones"><button type="button" class="boton" data-accion="recargar">Volver a intentar</button></div></section>`;
     } else if (estado.cargando) {
       vista.innerHTML = '<p class="nota">Cargando…</p>';
+    } else if (estado.vista === 'tarjetas') {
+      vista.innerHTML = vistaTarjetas();
     } else if (estado.vista === 'progreso') {
       vista.innerHTML = vistaProgreso();
       dibujarGraficos();
@@ -571,7 +884,7 @@
       faseDesde: null, pausaDesde: null, pausas: 0, msPausas: 0,
       controlMitad: null, controlPendiente: false, avisoFin: false,
       tarjetas: { hecho: null, repasadas: null, otra_vez: null },
-      borrador: {},
+      borrador: diaDeHoy() ? { t_hecho: 'si', t_repasadas: String(diaDeHoy().repasadas), t_otra_vez: String(diaDeHoy().otra_vez) } : {},
     };
     guardarEnCurso();
     pitido(0); // prepara el sonido mientras hay un clic del usuario
@@ -654,12 +967,15 @@
     try { await cargarProyecto(); } catch { /* se verá al recargar */ }
     pintar();
     window.scrollTo(0, 0);
+    if (!pendiente) sincronizar();
   }
 
   async function elegirProyecto(slug) {
     if (estado.enCurso || slug === estado.slug) return;
+    if (estado.repaso) await guardarRepaso();   // un repaso a medias se guarda antes de cambiar
     estado.slug = slug;
     estado.guardada = null;
+    estado.repasoHecho = null;
     Memoria.guardar('slug', slug);
     try { await cargarProyecto(); estado.error = null; } catch (e) { estado.error = e.message; }
     pintar();
@@ -667,8 +983,15 @@
 
   async function iniciar() {
     estado.cargando = true; estado.error = null;
+    if (!Almacen.conectado()) { estado.cargando = false; estado.vista = 'ajustes'; pintar(); return; }
+    pintar();
     try {
       if (location.protocol === 'file:') throw new Error('La aplicación se ha abierto como un archivo suelto.');
+      if (Almacen.modo === 'local') {
+        // Antes de leer, traer lo que el teléfono haya escrito (con un máximo de espera).
+        await Promise.race([sincronizar(true), new Promise((listo) => setTimeout(listo, 15000))]);
+        Almacen.descripcionLocal().then((d) => { estado.carpeta = d.datos; }).catch(() => {});
+      }
       const lista = await Almacen.leer('02-proyectos/proyectos.json');
       estado.proyectos = ((lista && lista.proyectos) || []).filter((p) => p.estado !== 'archivado' && p.minutos);
       if (!estado.proyectos.length) throw new Error('No hay proyectos en 02-proyectos/proyectos.json.');
@@ -682,6 +1005,9 @@
     }
     estado.cargando = false;
     pintar();
+    // Una ronda de repaso que quedó sin guardar (o de otro día) se guarda ahora.
+    const r = estado.repaso;
+    if (r && !estado.error && (r.porGuardar || r.fecha !== fechaISO())) guardarRepaso();
   }
 
   document.addEventListener('click', async (evento) => {
@@ -712,17 +1038,37 @@
       pintar();
     }
     else if (accion === 'recargar') iniciar();
+    else if (accion === 'repaso-empezar') empezarRepaso();
+    else if (accion === 'mostrar' && estado.repaso) { estado.repaso.mostrada = true; guardarRonda(); pintar(); }
+    else if (accion === 'nota') responderTarjeta(boton.dataset.valor);
+    else if (accion === 'repaso-saltar' && estado.repaso) { estado.repaso.cola.shift(); guardarRonda(); if (estado.repaso.cola.length) pintar(); else guardarRepaso(); }
+    else if (accion === 'repaso-terminar' || accion === 'repaso-reintentar') guardarRepaso();
+    else if (accion === 'tarjetas-iniciar') iniciarTarjetas(boton.dataset.valor === 'conocidas');
+    else if (accion === 'sincronizar') { globo('Sincronizando…'); const s = await sincronizar(true); if (s.ok) { await cargarProyecto().catch(() => {}); } pintar(); }
+    else if (accion === 'desconectar') {
+      if (window.confirm('¿Desconectar este dispositivo? Tus datos siguen en GitHub; solo se borra la llave de este navegador.')) { Almacen.desconectar(); estado.proyectos = []; estado.vista = 'ajustes'; pintar(); }
+    }
+  });
+
+  // Atajos de teclado para repasar en el ordenador: espacio muestra; 1, 2 y 3 califican.
+  document.addEventListener('keydown', (evento) => {
+    const r = estado.repaso;
+    if (estado.vista !== 'tarjetas' || !r || !r.cola.length || r.porGuardar) return;
+    if (evento.target.closest('input, textarea, select, button')) return;
+    if (!r.mostrada && (evento.key === ' ' || evento.key === 'Enter')) { evento.preventDefault(); r.mostrada = true; guardarRonda(); pintar(); }
+    else if (r.mostrada && ['1', '2', '3'].includes(evento.key)) responderTarjeta({ 1: 'otra', 2: 'bien', 3: 'facil' }[evento.key]);
   });
 
   document.addEventListener('submit', (evento) => {
     evento.preventDefault();
     if (evento.target.id === 'form-tarjetas') enviarTarjetas(evento.target);
     else if (evento.target.id === 'form-cierre') enviarCierre(evento.target);
+    else if (evento.target.id === 'form-conexion') conectar(evento.target);
   });
 
   // Lo escrito en un formulario se guarda al momento, por si se recarga la página.
   document.addEventListener('input', (evento) => {
-    const formulario = evento.target.closest('#vista form');
+    const formulario = evento.target.closest('#form-tarjetas, #form-cierre');
     if (!formulario || !estado.enCurso) return;
     estado.enCurso.borrador = Object.fromEntries(new FormData(formulario).entries());
     guardarEnCurso();
@@ -733,6 +1079,10 @@
     clearTimeout(esperaRedibujo);
     esperaRedibujo = setTimeout(dibujarGraficos, 150);
   });
+
+  if ('serviceWorker' in navigator && Almacen.modo === 'github') {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
 
   setInterval(latido, 500);
   iniciar();

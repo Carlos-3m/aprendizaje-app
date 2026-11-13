@@ -5,7 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>Aprendizaje</title>
+  <meta name="theme-color" content="#256abf">
+  <link rel="manifest" href="app.webmanifest">
   <link rel="icon" href="icono.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="icono-192.png">
   <link rel="stylesheet" href="estilos.css">
 </head>
 <body>
@@ -14,7 +17,9 @@
       <h1>Aprendizaje</h1>
       <nav class="pestanas" aria-label="Secciones">
         <button type="button" data-accion="vista" data-vista="hoy">Hoy</button>
+        <button type="button" data-accion="vista" data-vista="tarjetas">Tarjetas</button>
         <button type="button" data-accion="vista" data-vista="progreso">Progreso</button>
+        <button type="button" data-accion="vista" data-vista="ajustes">Ajustes</button>
       </nav>
     </div>
     <div id="proyectos" class="proyectos" role="group" aria-label="Proyecto"></div>
