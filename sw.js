@@ -2,7 +2,7 @@
    Permite abrir la aplicación sin conexión. Siempre intenta primero la red,
    para que las mejoras lleguen solas; si no hay red, usa la copia guardada.
    Nunca toca las peticiones a GitHub (los datos). */
-const COPIA = 'aprendizaje-v2';
+const COPIA = 'aprendizaje-v3';
 const ARCHIVOS = ['./', 'index.html', 'estilos.css', 'app.js', 'almacen.js', 'graficos.js', 'icono.svg', 'icono-192.png', 'app.webmanifest'];
 
 self.addEventListener('install', (evento) => {

@@ -1,4 +1,4 @@
-# Aplicación de aprendizaje · versión 0.2
+# Aplicación de aprendizaje · versión 0.3
 
 Acompaña las sesiones de estudio: muestra la sesión preparada, la cronometra, avisa a mitad y al final del núcleo, recoge el cierre, lleva el repaso de tarjetas y enseña si las sesiones están saliendo fáciles, justas o difíciles.
 
@@ -32,6 +32,7 @@ En el teléfono: desde el menú del navegador, «Instalar aplicación» o «Aña
 - Repaso espaciado: cada acierto aleja la tarjeta; cada fallo la trae de vuelta.
 - Tres respuestas: «Otra vez», «Bien» y «Fácil». En el ordenador: espacio para ver la respuesta; 1, 2 y 3 para calificar.
 - Al terminar guarda cuántas repasaste y cuáles fallaste, para que el coach las use en el calentamiento.
+- **Clasificar** (desde la 0.3), para tarjetas que ya conocías: las recorres en el orden en que se crearon, por tandas de 20, y dices cómo llevas cada una. «Fácil» vuelve en 15 días, «La sé, pero me cuesta» en 3 y «No la recuerdo» mañana (cuenta como fallada). Mientras queden por clasificar, esas tarjetas no entran como nuevas.
 
 **Progreso**
 

@@ -1,5 +1,5 @@
 'use strict';
-/* Aplicación de aprendizaje · versión 0.2
+/* Aplicación de aprendizaje · versión 0.3
    Pantallas: «Hoy» (guía y cronometra la sesión), «Tarjetas» (repaso espaciado),
    «Progreso» (si las sesiones salen fáciles, justas o difíciles) y «Ajustes». */
 (() => {
@@ -562,7 +562,7 @@
   function colaDeHoy() {
     const hoy = fechaISO();
     const guardado = guardadoTarjetas();
-    const vencidas = estado.tarjetas.filter((x) => guardado[x.id] && guardado[x.id].vence <= hoy)
+    const vencidas = estado.tarjetas.filter((x) => guardado[x.id] && !guardado[x.id].clasificar && guardado[x.id].vence <= hoy)
       .sort((a, b) => guardado[a.id].vence.localeCompare(guardado[b.id].vence));
     const yaNuevas = (diaDeHoy() || {}).nuevas || 0;
     const limite = Math.max(0, (proyecto().tarjetas_nuevas_dia ?? NUEVAS_AL_DIA) - yaNuevas);
@@ -597,7 +597,43 @@
     return e;
   }
 
+  /** Clasificar: tarjetas que ya se conocían (venían de Anki) y esperan a que el aprendiz diga cómo las lleva. */
+  const TANDA_CLASIFICAR = 20;
+  const porClasificar = () => { const g = guardadoTarjetas(); return estado.tarjetas.filter((x) => g[x.id] && g[x.id].clasificar); };
+  const sinVer = () => { const g = guardadoTarjetas(); return estado.tarjetas.filter((x) => !g[x.id]); };
+  /** Fácil → 15 días · «La sé, pero me cuesta» → 3 días · «No la recuerdo» → mañana, y cuenta como fallada. */
+  function clasificarTarjeta(nota, hoy) {
+    const dias = { facil: 15, bien: 3, otra: 1 }[nota];
+    return { intervalo: dias, facilidad: nota === 'otra' ? 2.3 : 2.5, repasos: 1, fallos: nota === 'otra' ? 1 : 0,
+      vence: sumarDias(hoy, dias), ultimo: hoy };
+  }
+
   function guardarRonda() { if (estado.repaso) Memoria.guardar('repaso', estado.repaso); else Memoria.borrar('repaso'); }
+
+  function empezarClasificar() {
+    const cola = porClasificar().slice(0, TANDA_CLASIFICAR).map((x) => x.id);
+    if (!cola.length) return;
+    estado.repasoHecho = null; estado.repasoError = '';
+    estado.repaso = { id: 'c-' + Date.now(), slug: estado.slug, fecha: fechaISO(), cola, mostrada: false, clasificar: true,
+      conteo: { facil: 0, bien: 0, otra: 0 }, cambios: {}, vistas: [], falladas: [], frentesFallados: [], nuevas: [], porGuardar: false };
+    guardarRonda(); pintar();
+  }
+
+  /** Marca para clasificar las tarjetas que aún no tienen calendario (releyendo antes el archivo). */
+  async function marcarParaClasificar() {
+    try {
+      const ruta = rutaRepasos(estado.slug);
+      const archivo = (await Almacen.leer(ruta)) || { tarjetas: {}, dias: {} };
+      archivo.aviso = archivo.aviso || 'Estado de repaso de las tarjetas. Lo escribe la aplicación. «tarjetas» guarda cuándo vuelve a tocar cada una; «dias» resume cada día de repaso y qué tarjetas se fallaron.';
+      archivo.tarjetas = archivo.tarjetas || {};
+      archivo.dias = archivo.dias || {};
+      estado.tarjetas.forEach((x) => { if (!archivo.tarjetas[x.id]) archivo.tarjetas[x.id] = { clasificar: true, frente: x.frente.slice(0, 90) }; });
+      await Almacen.escribir(ruta, archivo);
+      estado.repasos = archivo; estado.repasoError = '';
+      sincronizar();
+    } catch (e) { estado.repasoError = 'No se pudieron preparar las tarjetas: ' + e.message; }
+    pintar();
+  }
 
   function empezarRepaso() {
     const { vencidas, nuevas } = colaDeHoy();
@@ -617,6 +653,18 @@
     const guardado = guardadoTarjetas();
     const vista = r.vistas.includes(id);
     const fallada = r.falladas.includes(id);
+    if (r.clasificar) {
+      const hecho = clasificarTarjeta(nota, r.fecha);
+      if (tarjeta) hecho.frente = tarjeta.frente.slice(0, 90);
+      r.cambios[id] = hecho;
+      if (!vista) r.vistas.push(id);
+      r.conteo[nota] += 1;
+      if (nota === 'otra' && !fallada) { r.falladas.push(id); if (tarjeta) r.frentesFallados.push(tarjeta.frente); }
+      r.mostrada = false;
+      guardarRonda();
+      if (r.cola.length) pintar(); else guardarRepaso();
+      return;
+    }
     const nuevo = calificar(r.cambios[id] || guardado[id] || null, nota, r.fecha, vista, fallada);
     if (tarjeta) nuevo.frente = tarjeta.frente.slice(0, 90);
     r.cambios[id] = nuevo;
@@ -650,11 +698,13 @@
         dia.repasadas += r.vistas.length;
         dia.otra_vez += r.falladas.length;
         dia.nuevas += r.nuevas.length;
+        if (r.clasificar) dia.clasificadas = (dia.clasificadas || 0) + r.vistas.length;
         dia.falladas = [...new Set([...(dia.falladas || []), ...r.frentesFallados])];
       }
       archivo.dias[r.fecha] = dia;
       await Almacen.escribir(ruta, archivo);
-      estado.repasoHecho = { repasadas: r.vistas.length, otra_vez: r.falladas.length, falladas: r.frentesFallados.slice(), quedaban: r.cola.length };
+      estado.repasoHecho = { repasadas: r.vistas.length, otra_vez: r.falladas.length, falladas: r.frentesFallados.slice(), quedaban: r.cola.length,
+        clasificar: !!r.clasificar, conteo: r.conteo ? { ...r.conteo } : null };
       if (r.slug === estado.slug) estado.repasos = archivo;
       estado.repaso = null; estado.repasoError = '';
       guardarRonda();
@@ -666,10 +716,11 @@
   }
 
   /** Primera vez: crea datos/repasos.json. */
-  async function iniciarTarjetas(conocidas) {
+  async function iniciarTarjetas(modo) {
+    if (modo === 'clasificar') return marcarParaClasificar();
     const hoy = fechaISO();
     const archivo = { aviso: 'Estado de repaso de las tarjetas. Lo escribe la aplicación. «tarjetas» guarda cuándo vuelve a tocar cada una; «dias» resume cada día de repaso y qué tarjetas se fallaron.', tarjetas: {}, dias: {} };
-    if (conocidas) {
+    if (modo === 'conocidas') {
       const porDia = Math.max(10, Math.ceil(estado.tarjetas.length / 10));
       estado.tarjetas.forEach((x, i) => {
         archivo.tarjetas[x.id] = { intervalo: 3, facilidad: 2.5, repasos: 0, fallos: 0, vence: sumarDias(hoy, Math.floor(i / porDia)), ultimo: null, frente: x.frente.slice(0, 90) };
@@ -689,15 +740,18 @@
     const hechas = total - new Set(r.cola).size;
     if (!tarjeta) return `<section class="tarjeta"><h2>Esta tarjeta ya no existe</h2><p>Puede que el coach la haya cambiado.</p><div class="acciones"><button type="button" class="boton" data-accion="repaso-saltar">Seguir</button></div></section>`;
     return `<section class="tarjeta naipe">
-      <p class="sobretitulo">${total - hechas === 1 ? 'Queda 1' : 'Quedan ' + (total - hechas)} de ${total}${r.falladas.includes(tarjeta.id) ? ' · repetida porque la fallaste' : ''}</p>
+      <p class="sobretitulo">${r.clasificar ? 'Clasificando · ' : ''}${total - hechas === 1 ? 'Queda 1' : 'Quedan ' + (total - hechas)} de ${total}${!r.clasificar && r.falladas.includes(tarjeta.id) ? ' · repetida porque la fallaste' : ''}</p>
       <div class="barra"><div class="barra-relleno" style="width:${(hechas / total) * 100}%"></div></div>
       <p class="naipe-frente">${esc(tarjeta.frente)}</p>
       ${r.mostrada
         ? `<div class="naipe-dorso">${esc(tarjeta.dorso)}</div>
-           <div class="acciones notas"><button type="button" class="boton" data-accion="nota" data-valor="otra">Otra vez</button><button type="button" class="boton principal" data-accion="nota" data-valor="bien">Bien</button><button type="button" class="boton" data-accion="nota" data-valor="facil">Fácil</button></div>`
+           ${r.clasificar
+             ? `<div class="acciones notas"><button type="button" class="boton" data-accion="nota" data-valor="otra">No la recuerdo</button><button type="button" class="boton principal" data-accion="nota" data-valor="bien">La sé, pero me cuesta</button><button type="button" class="boton" data-accion="nota" data-valor="facil">Fácil</button></div>
+                <p class="ayuda">No la recuerdo: vuelve mañana · Me cuesta: en 3 días · Fácil: en 15 días.</p>`
+             : `<div class="acciones notas"><button type="button" class="boton" data-accion="nota" data-valor="otra">Otra vez</button><button type="button" class="boton principal" data-accion="nota" data-valor="bien">Bien</button><button type="button" class="boton" data-accion="nota" data-valor="facil">Fácil</button></div>`}`
         : `<p class="ayuda">Responde de memoria, en voz alta o por escrito, antes de mirar.</p>
            <div class="acciones"><button type="button" class="boton principal" data-accion="mostrar">Mostrar respuesta</button></div>`}
-      <p class="pie-sesion"><button type="button" class="enlace" data-accion="repaso-terminar">Terminar por hoy y guardar</button></p>
+      <p class="pie-sesion"><button type="button" class="enlace" data-accion="repaso-terminar">${r.clasificar ? 'Parar aquí y guardar' : 'Terminar por hoy y guardar'}</button></p>
     </section>`;
   }
 
@@ -709,15 +763,19 @@
     if (!estado.repasos) {
       const n = estado.tarjetas.length;
       const porDia = Math.max(10, Math.ceil(n / 10));
+      const ejemplos = n > 6 ? [...estado.tarjetas.slice(0, 3), ...estado.tarjetas.slice(-3)] : estado.tarjetas;
       return error + `<section class="tarjeta">
         <p class="sobretitulo">Primera vez</p>
         <h2>${n === 1 ? 'Hay 1 tarjeta' : 'Hay ' + n + ' tarjetas'} en este proyecto</h2>
+        <p>${n > 6 ? 'Las tres primeras y las tres últimas' : 'Son estas'}:</p>
+        <ul class="lista ejemplos">${ejemplos.map((x) => `<li>${esc(x.frente)}</li>`).join('')}</ul>
         <p>El calendario de repaso empieza de cero. Elige cómo:</p>
         <ul class="lista">
-          <li><strong>Ya las conozco</strong> (venían de Anki): ${n <= porDia ? 'tocan todas hoy' : 'se reparten en los próximos ' + Math.ceil(n / porDia) + ' días, ' + porDia + ' al día'}, y después cada una se aleja según aciertes.</li>
+          <li><strong>Clasificarlas una a una</strong> (si venían de Anki y unas te cuestan más que otras): las recorres en orden, por tandas de ${TANDA_CLASIFICAR}, y dices cómo llevas cada una.</li>
+          <li><strong>Ya las conozco todas</strong>: ${n <= porDia ? 'tocan todas hoy' : 'se reparten en los próximos ' + Math.ceil(n / porDia) + ' días, ' + porDia + ' al día'}, y después cada una se aleja según aciertes.</li>
           <li><strong>Son nuevas para mí</strong>: entran ${NUEVAS_AL_DIA} al día.</li>
         </ul>
-        <div class="acciones"><button type="button" class="boton principal" data-accion="tarjetas-iniciar" data-valor="conocidas">Ya las conozco</button><button type="button" class="boton" data-accion="tarjetas-iniciar" data-valor="nuevas">Son nuevas para mí</button></div>
+        <div class="acciones"><button type="button" class="boton principal" data-accion="tarjetas-iniciar" data-valor="clasificar">Clasificarlas una a una</button><button type="button" class="boton" data-accion="tarjetas-iniciar" data-valor="conocidas">Ya las conozco todas</button><button type="button" class="boton" data-accion="tarjetas-iniciar" data-valor="nuevas">Son nuevas para mí</button></div>
       </section>`;
     }
     const { vencidas, nuevas } = colaDeHoy();
@@ -729,11 +787,26 @@
     let html = error;
     const hecho = estado.repasoHecho;
     if (hecho) {
+      const c = hecho.conteo;
       html += `<section class="tarjeta">
-        <p class="sobretitulo">Repaso guardado</p>
-        <h2>${hecho.repasadas} ${hecho.repasadas === 1 ? 'tarjeta repasada' : 'tarjetas repasadas'}, ${hecho.otra_vez} «Otra vez»</h2>
-        ${hecho.falladas.length ? `<h3>Las que fallaste</h3><ul class="lista">${hecho.falladas.map((f) => `<li>${esc(f)}</li>`).join('')}</ul><p class="ayuda">El coach las verá y las usará en el calentamiento.</p>` : '<p>Ninguna fallada.</p>'}
+        <p class="sobretitulo">${hecho.clasificar ? 'Tanda guardada' : 'Repaso guardado'}</p>
+        <h2>${hecho.clasificar
+          ? `${hecho.repasadas} ${hecho.repasadas === 1 ? 'tarjeta clasificada' : 'tarjetas clasificadas'}: ${c.facil} fáciles, ${c.bien} te cuestan, ${c.otra} no las recordabas`
+          : `${hecho.repasadas} ${hecho.repasadas === 1 ? 'tarjeta repasada' : 'tarjetas repasadas'}, ${hecho.otra_vez} «Otra vez»`}</h2>
+        ${hecho.falladas.length ? `<h3>${hecho.clasificar ? 'Las que no recordabas' : 'Las que fallaste'}</h3><ul class="lista">${hecho.falladas.map((f) => `<li>${esc(f)}</li>`).join('')}</ul><p class="ayuda">El coach las verá y las usará en el calentamiento.</p>` : '<p>Ninguna fallada.</p>'}
       </section>`;
+    }
+    const quedan = porClasificar().length;
+    const noVistas = sinVer().length;
+    if (quedan) {
+      html += `<section class="tarjeta">
+        <p class="sobretitulo">Clasificar las que ya conocías</p>
+        <h2>${quedan === 1 ? 'Queda 1 por clasificar' : 'Quedan ' + quedan + ' por clasificar'}</h2>
+        <p>En el orden en que se crearon, de ${Math.min(TANDA_CLASIFICAR, quedan)} en ${Math.min(TANDA_CLASIFICAR, quedan)}. Responde de memoria antes de mirar y di cómo la llevas. Puedes parar cuando quieras: lo hecho se guarda.</p>
+        <div class="acciones"><button type="button" class="boton${pendientesDeHoy() ? '' : ' principal'}" data-accion="clasificar-empezar">Clasificar ${Math.min(TANDA_CLASIFICAR, quedan)}</button></div>
+      </section>`;
+    } else if (noVistas > NUEVAS_AL_DIA) {
+      html += `<p class="ayuda">¿Ya conocías algunas de las ${noVistas} tarjetas que aún no has visto? <button type="button" class="enlace" data-accion="clasificar-marcar">Clasificarlas una a una</button></p>`;
     }
     html += `<section class="tarjeta">
       <p class="sobretitulo">${estado.tarjetas.length} tarjetas en el proyecto</p>
@@ -760,7 +833,7 @@
         <p class="ayuda">La aplicación guarda y sube a GitHub solo sus archivos de datos (sesiones y repasos). Lo demás lo sube el coach al cerrar cada sesión.</p>
         <div class="acciones"><button type="button" class="boton" data-accion="sincronizar">Sincronizar ahora</button></div>
       </section>
-      <section class="tarjeta"><h2>Versión</h2><p>Aplicación de aprendizaje 0.2 · en este ordenador.</p></section>`;
+      <section class="tarjeta"><h2>Versión</h2><p>Aplicación de aprendizaje 0.3 · en este ordenador.</p></section>`;
     }
     const c = Almacen.configuracion();
     if (c && c.token) {
@@ -771,7 +844,7 @@
         ${mensaje}
         <div class="acciones"><button type="button" class="boton" data-accion="desconectar">Desconectar este dispositivo</button></div>
       </section>
-      <section class="tarjeta"><h2>Versión</h2><p>Aplicación de aprendizaje 0.2 · conectada a GitHub.</p></section>`;
+      <section class="tarjeta"><h2>Versión</h2><p>Aplicación de aprendizaje 0.3 · conectada a GitHub.</p></section>`;
     }
     const d = Almacen.configuracionPorDefecto();
     return `<section class="tarjeta">
@@ -1043,7 +1116,9 @@
     else if (accion === 'nota') responderTarjeta(boton.dataset.valor);
     else if (accion === 'repaso-saltar' && estado.repaso) { estado.repaso.cola.shift(); guardarRonda(); if (estado.repaso.cola.length) pintar(); else guardarRepaso(); }
     else if (accion === 'repaso-terminar' || accion === 'repaso-reintentar') guardarRepaso();
-    else if (accion === 'tarjetas-iniciar') iniciarTarjetas(boton.dataset.valor === 'conocidas');
+    else if (accion === 'tarjetas-iniciar') iniciarTarjetas(boton.dataset.valor);
+    else if (accion === 'clasificar-empezar') empezarClasificar();
+    else if (accion === 'clasificar-marcar') marcarParaClasificar();
     else if (accion === 'sincronizar') { globo('Sincronizando…'); const s = await sincronizar(true); if (s.ok) { await cargarProyecto().catch(() => {}); } pintar(); }
     else if (accion === 'desconectar') {
       if (window.confirm('¿Desconectar este dispositivo? Tus datos siguen en GitHub; solo se borra la llave de este navegador.')) { Almacen.desconectar(); estado.proyectos = []; estado.vista = 'ajustes'; pintar(); }
